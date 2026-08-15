@@ -101,6 +101,17 @@ type ProviderStatusChecker interface {
 	ShouldRefreshCache() bool
 }
 
+// BoundedProvider is implemented by providers backed by a fixed dataset compiled
+// into the binary, whose full species list is therefore knowable up front.
+//
+// Only a provider that can answer definitively should implement this. One that
+// queries a remote catalogue cannot know its own coverage without a network
+// round trip, so it stays unbounded and keeps the ordinary policy behaviour.
+type BoundedProvider interface {
+	// Covers reports whether this provider's dataset contains the species.
+	Covers(scientificName string) bool
+}
+
 // contextFetcher is implemented by providers that accept a context. It is not part of
 // ImageProvider because that interface is the stable extension point for third-party
 // providers; this is an optional capability probed at call time.
@@ -132,6 +143,35 @@ func normalizedFallbackPolicy() string {
 // normalizeProviderName folds a configured provider name for comparison.
 func normalizeProviderName(name string) string {
 	return strings.ToLower(strings.TrimSpace(name))
+}
+
+// fallbackAllowedFor reports whether the other registered providers may be
+// consulted for this species.
+//
+// "all" means the user asked for the fallback chain, so it is always allowed.
+// Beyond that, a BoundedProvider that does not cover the species is exempt from
+// the policy: its dataset is fixed at build time, so it will return "not found"
+// for that name on every future call as well. Honouring "none" there would not
+// be deferring to the user's preference, it would be caching a permanent
+// placeholder for a species the configured provider was never able to supply --
+// which is what leaves bat and other non-avian detections showing a bird glyph
+// while the shipped Wikimedia provider has a perfectly good photo of them.
+//
+// The exemption is deliberately narrow. A provider that merely failed -- a
+// timeout, a rate limit, a 5xx -- is not exempt, because that is a transient
+// "no answer today" rather than a structural one, and the policy should still
+// govern it.
+func (c *BirdImageCache) fallbackAllowedFor(scientificName string) bool {
+	if normalizedFallbackPolicy() == fallbackPolicyAll {
+		return true
+	}
+
+	providerPtr := c.provider.Load()
+	if providerPtr == nil {
+		return false
+	}
+	bounded, ok := (*providerPtr).(BoundedProvider)
+	return ok && !bounded.Covers(scientificName)
 }
 
 // normalizedImageProvider reads the configured image provider, folded.
@@ -821,7 +861,7 @@ func (c *BirdImageCache) tryRefreshFallback(scientificName string) (BirdImage, b
 		logger.String("provider", c.providerName),
 		logger.String("scientific_name", scientificName))
 
-	if normalizedFallbackPolicy() != fallbackPolicyAll {
+	if !c.fallbackAllowedFor(scientificName) {
 		return BirdImage{}, false
 	}
 
@@ -1377,7 +1417,7 @@ func (c *BirdImageCache) logInitializeError(err error, scientificName string, lo
 // tryFallbackOnGetError attempts to get the image from fallback providers on error.
 // Returns (image, found).
 func (c *BirdImageCache) tryFallbackOnGetError(ctx context.Context, err error, scientificName string, log logger.Logger) (BirdImage, bool) {
-	if normalizedFallbackPolicy() != fallbackPolicyAll {
+	if !c.fallbackAllowedFor(scientificName) {
 		log.Debug("Primary provider failed but fallback policy is 'none'",
 			logger.Error(err))
 		return BirdImage{}, false
@@ -1496,7 +1536,7 @@ func (c *BirdImageCache) GetCached(scientificName string) (img BirdImage, found,
 	// primary's negative entry as definitive would answer 404 with a 24h browser
 	// cache for every species the primary lacks but a fallback has, permanently
 	// hiding images the user enabled fallbacks to get.
-	if normalizedFallbackPolicy() != fallbackPolicyAll {
+	if !c.fallbackAllowedFor(scientificName) {
 		return img, found, negative
 	}
 	registry := c.GetRegistry()

@@ -194,6 +194,49 @@ func NewAviCommonsProvider(dataFs fs.FS, debug bool) (*AviCommonsProvider, error
 	}, nil
 }
 
+// lookupLocked resolves a scientific name against the loaded Avicommons data,
+// applying the same taxonomy-synonym retry Fetch relies on. Callers must hold
+// at least a read lock on p.mu.
+//
+// Fetch and Covers both go through here so the two can never disagree: a name
+// Covers reports as present must be a name Fetch can serve, otherwise Covers
+// would suppress the fallback for a species the provider then fails to supply.
+func (p *AviCommonsProvider) lookupLocked(scientificName string, log logger.Logger) (entry *aviCommonsEntry, found bool) {
+	entry, found = p.sciNameMap[strings.ToLower(scientificName)]
+	if found {
+		return entry, true
+	}
+
+	// Try taxonomy synonym if primary name not found
+	if synonym, hasSynonym := GetTaxonomySynonym(scientificName); hasSynonym {
+		if entry, found = p.sciNameMap[strings.ToLower(synonym)]; found {
+			log.Debug("Image found using taxonomy synonym",
+				logger.String("original_name", scientificName),
+				logger.String("synonym", synonym))
+			return entry, true
+		}
+	}
+
+	return nil, false
+}
+
+// Covers reports whether the bundled Avicommons snapshot contains this species.
+//
+// The snapshot is a fixed dataset compiled into the binary, so a name it does
+// not contain can never be served by this provider — not on retry, not after a
+// cache expiry, not ever. Callers use that distinction to tell "this provider
+// has no answer today" apart from "this provider structurally cannot answer",
+// which are very different grounds for consulting another provider.
+func (p *AviCommonsProvider) Covers(scientificName string) bool {
+	log := GetLogger().With(
+		logger.String("provider", aviCommonsProviderName),
+		logger.String("scientific_name", scientificName))
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, found := p.lookupLocked(scientificName, log)
+	return found
+}
+
 // Fetch retrieves image information for a given scientific name from the Avicommons data.
 func (p *AviCommonsProvider) Fetch(scientificName string) (BirdImage, error) {
 	log := GetLogger().With(
@@ -203,26 +246,10 @@ func (p *AviCommonsProvider) Fetch(scientificName string) (BirdImage, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	// Normalize the input scientific name for lookup
-	normalizedSciName := strings.ToLower(scientificName)
-	entry, found := p.sciNameMap[normalizedSciName]
-
-	if !found {
-		// Try taxonomy synonym if primary name not found
-		if synonym, hasSynonym := GetTaxonomySynonym(scientificName); hasSynonym {
-			normalizedSynonym := strings.ToLower(synonym)
-			entry, found = p.sciNameMap[normalizedSynonym]
-			if found {
-				log.Debug("Image found using taxonomy synonym",
-					logger.String("original_name", scientificName),
-					logger.String("synonym", synonym))
-			}
-		}
-	}
-
+	entry, found := p.lookupLocked(scientificName, log)
 	if !found {
 		log.Debug("Image not found in Avicommons data",
-			logger.String("normalized_name", normalizedSciName))
+			logger.String("normalized_name", strings.ToLower(scientificName)))
 		return BirdImage{}, imageNotFoundFor(scientificName, aviCommonsProviderName, "avicommons_lookup")
 	}
 
